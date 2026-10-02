@@ -1895,10 +1895,28 @@ ESIMD_INLINE void dequantize_mul_mat_vec_reorder_esimd(
     simd<float, 32> acc1 = 0.0f;
 
     for (int ib = tid; ib < num_blocks_per_row; ib += GGML_SYCL_DMMV_ESIMD_WG_SIZE) {
-        simd<float, 256> y_vec = block_load<float, 256>(y + (size_t) ib * QK_K);
-
         const size_t bi0 = (size_t) (row0 + 0) * num_blocks_per_row + ib;
         const size_t bi1 = (size_t) (row0 + 1) * num_blocks_per_row + ib;
+
+#ifdef GGML_SYCL_BMG_PREFETCH
+        // Prefetch the next iteration's weight blocks (qs + scales) so their
+        // DRAM latency overlaps the current block's dequant. Q4_K reorder
+        // layout: qs = 128 B/block, scales = K_SCALE_SIZE(12) B/block.
+        if constexpr (T == GGML_TYPE_Q4_K) {
+            const size_t bi0n = bi0 + GGML_SYCL_DMMV_ESIMD_WG_SIZE;
+            const size_t bi1n = bi1 + GGML_SYCL_DMMV_ESIMD_WG_SIZE;
+            if (bi0n < nb) {
+                ggml_sycl_esimd::w_prefetch<QK_K / 2>(ps.qs + bi0n * (QK_K / 2));
+                ggml_sycl_esimd::w_prefetch<K_SCALE_SIZE>(ps.scales + bi0n * K_SCALE_SIZE);
+            }
+            if (has_row1 && bi1n < nb) {
+                ggml_sycl_esimd::w_prefetch<QK_K / 2>(ps.qs + bi1n * (QK_K / 2));
+                ggml_sycl_esimd::w_prefetch<K_SCALE_SIZE>(ps.scales + bi1n * K_SCALE_SIZE);
+            }
+        }
+#endif
+
+        simd<float, 256> y_vec = block_load<float, 256>(y + (size_t) ib * QK_K);
 
         traits::mac_pair(ps, bi0, ps, bi1, has_row1, y_vec, acc0, acc1);
     }

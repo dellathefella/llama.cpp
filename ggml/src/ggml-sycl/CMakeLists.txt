@@ -193,6 +193,16 @@ if (GGML_SYCL_GRAPH)
     target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_GRAPH)
 endif()
 
+if (GGML_SYCL_BMG_STREAM_W)
+    message(STATUS "GGML_SYCL_BMG_STREAM_W: Xe2/BMG weight-streaming ESIMD loads enabled")
+    target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_BMG_STREAM_W)
+endif()
+
+if (GGML_SYCL_BMG_PREFETCH)
+    message(STATUS "GGML_SYCL_BMG_PREFETCH: Xe2/BMG ESIMD matvec weight prefetch enabled")
+    target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_BMG_PREFETCH)
+endif()
+
 if (GGML_SYCL_HOST_MEM_FALLBACK)
     message(STATUS "find GGML_SYCL_HOST_MEM_FALLBACK")
     target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_HOST_MEM_FALLBACK)

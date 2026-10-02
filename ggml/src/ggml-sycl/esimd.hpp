@@ -9,6 +9,50 @@ namespace ggml_sycl_esimd {
 
 constexpr int GGML_SYCL_DMMV_ESIMD_WG_SIZE = 4;
 
+// B60/Xe2 weight-streaming loads. During batch-1 decode the whole weight matrix
+// is re-read every token; streaming it past L1 frees the small per-slice L1 for
+// the activations / KV working set while L2 keeps caching the weights. Enabled
+// with -DGGML_SYCL_BMG_STREAM_W=1; the default keeps the stock cached policy.
+// Activation loads keep the default.
+//
+// Uses the oneAPI 2026 ESIMD property-list API. The supported combos are
+// L1∈{none,cached,uncached,streaming} x L2∈{none,uncached,cached} (L2
+// streaming is not offered). This variant is L1 uncached + L2 cached: the
+// full-bypass variant (L2 uncached too) measured neutral-to-negative on B60,
+// so we keep L2 reuse for the weights.
+template <typename T, int n>
+static ESIMD_INLINE sycl::ext::intel::esimd::simd<T, n> w_load(const T *ptr) {
+#ifdef GGML_SYCL_BMG_STREAM_W
+    using cache_t = sycl::ext::intel::esimd::cache_hint;
+    auto props = sycl::ext::intel::esimd::properties(
+        sycl::ext::intel::esimd::cache_hint_L1<cache_t::uncached>,
+        sycl::ext::intel::esimd::cache_hint_L2<cache_t::cached>);
+    return sycl::ext::intel::esimd::block_load<T, n>(ptr, props);
+#else
+    return sycl::ext::intel::esimd::block_load<T, n>(ptr);
+#endif
+}
+
+// B60/Xe2 weight prefetch. Issues an LSC prefetch for the cache lines covering a
+// `bytes`-byte weight region one iteration ahead of when it is consumed, raising
+// the count of outstanding memory requests so the bandwidth-bound decode loop
+// keeps DRAM busy while the current block is being dequantized. `ptr` must be
+// 4-byte aligned. Enabled with -DGGML_SYCL_BMG_PREFETCH=1.
+template <int bytes>
+static ESIMD_INLINE void w_prefetch(const void *ptr) {
+    constexpr int lines = (bytes + 63) / 64;
+    sycl::ext::intel::esimd::simd<uint32_t, lines> offs;
+#pragma unroll
+    for (int i = 0; i < lines; ++i)
+        offs[i] = i * 64;
+    using cache_t = sycl::ext::intel::esimd::cache_hint;
+    auto props = sycl::ext::intel::esimd::properties(
+        sycl::ext::intel::esimd::cache_hint_L1<cache_t::cached>,
+        sycl::ext::intel::esimd::cache_hint_L2<cache_t::cached>);
+    sycl::ext::intel::esimd::prefetch<uint32_t, lines, 1>(
+        (const uint32_t *) ptr, offs, props);
+}
+
 //
 // Shared ESIMD building blocks for the reordered K-quant dequantize-matvec
 // kernels.
@@ -93,9 +137,9 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q2_K> {
             sycl::ext::intel::esimd::simd<float, 32> & acc_b) {
         using namespace sycl::ext::intel::esimd;
 
-        simd<uint8_t, 64> qs_a     = block_load<uint8_t, 64>(pa.qs + bia * (QK_K / 4));
+        simd<uint8_t, 64> qs_a     = w_load<uint8_t, 64>(pa.qs + bia * (QK_K / 4));
         simd<uint8_t, 64> qs_b     = 0;
-        simd<uint8_t, 16> scales_a = block_load<uint8_t, 16>(pa.scales + bia * (QK_K / 16));
+        simd<uint8_t, 16> scales_a = w_load<uint8_t, 16>(pa.scales + bia * (QK_K / 16));
         simd<uint8_t, 16> scales_b = 0;
 
         const float dall_a = (float) pa.dm[bia * 2 + 0];
@@ -103,8 +147,8 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q2_K> {
         float dall_b = 0.0f;
         float dmin_b = 0.0f;
         if (has_b) {
-            qs_b     = block_load<uint8_t, 64>(pb.qs + bib * (QK_K / 4));
-            scales_b = block_load<uint8_t, 16>(pb.scales + bib * (QK_K / 16));
+            qs_b     = w_load<uint8_t, 64>(pb.qs + bib * (QK_K / 4));
+            scales_b = w_load<uint8_t, 16>(pb.scales + bib * (QK_K / 16));
             dall_b = (float) pb.dm[bib * 2 + 0];
             dmin_b = (float) pb.dm[bib * 2 + 1];
         }
@@ -219,19 +263,19 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q3_K> {
             sycl::ext::intel::esimd::simd<float, 32> & acc_b) {
         using namespace sycl::ext::intel::esimd;
 
-        simd<uint8_t, 64> qs_a     = block_load<uint8_t, 64>(pa.qs + bia * (QK_K / 4));
+        simd<uint8_t, 64> qs_a     = w_load<uint8_t, 64>(pa.qs + bia * (QK_K / 4));
         simd<uint8_t, 64> qs_b     = 0;
-        simd<uint8_t, 32> hmask_a  = block_load<uint8_t, 32>(pa.hmask + bia * (QK_K / 8));
+        simd<uint8_t, 32> hmask_a  = w_load<uint8_t, 32>(pa.hmask + bia * (QK_K / 8));
         simd<uint8_t, 32> hmask_b  = 0;
-        simd<uint8_t, 12> scales_a = block_load<uint8_t, 12>(pa.scales + bia * 12);
+        simd<uint8_t, 12> scales_a = w_load<uint8_t, 12>(pa.scales + bia * 12);
         simd<uint8_t, 12> scales_b = 0;
 
         const float d_a = (float) pa.d[bia];
         float d_b = 0.0f;
         if (has_b) {
-            qs_b     = block_load<uint8_t, 64>(pb.qs + bib * (QK_K / 4));
-            hmask_b  = block_load<uint8_t, 32>(pb.hmask + bib * (QK_K / 8));
-            scales_b = block_load<uint8_t, 12>(pb.scales + bib * 12);
+            qs_b     = w_load<uint8_t, 64>(pb.qs + bib * (QK_K / 4));
+            hmask_b  = w_load<uint8_t, 32>(pb.hmask + bib * (QK_K / 8));
+            scales_b = w_load<uint8_t, 12>(pb.scales + bib * 12);
             d_b = (float) pb.d[bib];
         }
 
@@ -304,9 +348,9 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q4_K> {
             sycl::ext::intel::esimd::simd<float, 32> & acc_b) {
         using namespace sycl::ext::intel::esimd;
 
-        simd<uint8_t, 128> qs_a     = block_load<uint8_t, 128>(pa.qs + bia * (QK_K / 2));
+        simd<uint8_t, 128> qs_a     = w_load<uint8_t, 128>(pa.qs + bia * (QK_K / 2));
         simd<uint8_t, 128> qs_b     = 0;
-        simd<uint8_t, 12>  scales_a = block_load<uint8_t, 12>(pa.scales + bia * K_SCALE_SIZE);
+        simd<uint8_t, 12>  scales_a = w_load<uint8_t, 12>(pa.scales + bia * K_SCALE_SIZE);
         simd<uint8_t, 12>  scales_b = 0;
 
         const float dall_a = (float) pa.dm[bia * 2 + 0];
@@ -314,8 +358,8 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q4_K> {
         float dall_b = 0.0f;
         float dmin_b = 0.0f;
         if (has_b) {
-            qs_b     = block_load<uint8_t, 128>(pb.qs + bib * (QK_K / 2));
-            scales_b = block_load<uint8_t, 12>(pb.scales + bib * K_SCALE_SIZE);
+            qs_b     = w_load<uint8_t, 128>(pb.qs + bib * (QK_K / 2));
+            scales_b = w_load<uint8_t, 12>(pb.scales + bib * K_SCALE_SIZE);
             dall_b = (float) pb.dm[bib * 2 + 0];
             dmin_b = (float) pb.dm[bib * 2 + 1];
         }
@@ -412,11 +456,11 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q5_K> {
             sycl::ext::intel::esimd::simd<float, 32> & acc_b) {
         using namespace sycl::ext::intel::esimd;
 
-        simd<uint8_t, 128> qs_a     = block_load<uint8_t, 128>(pa.qs + bia * (QK_K / 2));
+        simd<uint8_t, 128> qs_a     = w_load<uint8_t, 128>(pa.qs + bia * (QK_K / 2));
         simd<uint8_t, 128> qs_b     = 0;
-        simd<uint8_t, 32>  qh_a     = block_load<uint8_t, 32>(pa.qh + bia * (QK_K / 8));
+        simd<uint8_t, 32>  qh_a     = w_load<uint8_t, 32>(pa.qh + bia * (QK_K / 8));
         simd<uint8_t, 32>  qh_b     = 0;
-        simd<uint8_t, 12>  scales_a = block_load<uint8_t, 12>(pa.scales + bia * K_SCALE_SIZE);
+        simd<uint8_t, 12>  scales_a = w_load<uint8_t, 12>(pa.scales + bia * K_SCALE_SIZE);
         simd<uint8_t, 12>  scales_b = 0;
 
         const float dall_a = (float) pa.dm[bia * 2 + 0];
@@ -424,9 +468,9 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q5_K> {
         float dall_b = 0.0f;
         float dmin_b = 0.0f;
         if (has_b) {
-            qs_b     = block_load<uint8_t, 128>(pb.qs + bib * (QK_K / 2));
-            qh_b     = block_load<uint8_t, 32>(pb.qh + bib * (QK_K / 8));
-            scales_b = block_load<uint8_t, 12>(pb.scales + bib * K_SCALE_SIZE);
+            qs_b     = w_load<uint8_t, 128>(pb.qs + bib * (QK_K / 2));
+            qh_b     = w_load<uint8_t, 32>(pb.qh + bib * (QK_K / 8));
+            scales_b = w_load<uint8_t, 12>(pb.scales + bib * K_SCALE_SIZE);
             dall_b = (float) pb.dm[bib * 2 + 0];
             dmin_b = (float) pb.dm[bib * 2 + 1];
         }
@@ -512,19 +556,19 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q6_K> {
             sycl::ext::intel::esimd::simd<float, 32> & acc_b) {
         using namespace sycl::ext::intel::esimd;
 
-        simd<uint8_t, 128> ql_a     = block_load<uint8_t, 128>(pa.ql + bia * (QK_K / 2));
+        simd<uint8_t, 128> ql_a     = w_load<uint8_t, 128>(pa.ql + bia * (QK_K / 2));
         simd<uint8_t, 128> ql_b     = 0;
-        simd<uint8_t, 64>  qh_a     = block_load<uint8_t, 64>(pa.qh + bia * (QK_K / 4));
+        simd<uint8_t, 64>  qh_a     = w_load<uint8_t, 64>(pa.qh + bia * (QK_K / 4));
         simd<uint8_t, 64>  qh_b     = 0;
-        simd<int8_t, 16>   scales_a = block_load<int8_t, 16>(pa.scales + bia * (QK_K / 16));
+        simd<int8_t, 16>   scales_a = w_load<int8_t, 16>(pa.scales + bia * (QK_K / 16));
         simd<int8_t, 16>   scales_b = 0;
 
         const float d_a = (float) pa.d[bia];
         float d_b = 0.0f;
         if (has_b) {
-            ql_b     = block_load<uint8_t, 128>(pb.ql + bib * (QK_K / 2));
-            qh_b     = block_load<uint8_t, 64>(pb.qh + bib * (QK_K / 4));
-            scales_b = block_load<int8_t, 16>(pb.scales + bib * (QK_K / 16));
+            ql_b     = w_load<uint8_t, 128>(pb.ql + bib * (QK_K / 2));
+            qh_b     = w_load<uint8_t, 64>(pb.qh + bib * (QK_K / 4));
+            scales_b = w_load<int8_t, 16>(pb.scales + bib * (QK_K / 16));
             d_b = (float) pb.d[bib];
         }
 
