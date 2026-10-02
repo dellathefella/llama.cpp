@@ -27,6 +27,88 @@
 #include <stdexcept>
 #include <vector>
 
+#include "llama-expert-prefetch.h"
+
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <thread>
+
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
+namespace {
+struct epf_state {
+    std::thread th;
+    std::atomic<bool> stop{false};
+};
+epf_state g_epf;
+}
+
+void llama_expert_prefetch_stop() {
+    g_epf.stop.store(true);
+    if (g_epf.th.joinable()) {
+        g_epf.th.join();
+    }
+}
+
+void llama_expert_prefetch_start(llama_model_loader & ml, const std::string & arch) {
+    llama_expert_prefetch_stop();
+    if (arch != "qwen4exp") {
+        return;
+    }
+    const char * en = getenv("LLAMA_EXPERT_PREFETCH");
+    if (en && en[0] == '0') {
+        return;
+    }
+    int pace_ms = 0;
+    if (const char * p = getenv("LLAMA_EXPERT_PREFETCH_PACE_MS")) {
+        pace_ms = atoi(p);
+    }
+    struct rng { int fd; size_t off; size_t len; int layer; };
+    std::vector<rng> ranges;
+    size_t total = 0;
+    for (const auto & kv : ml.weights_map) {
+        const auto & w = kv.second;
+        const char * n = ggml_get_name(w.tensor);
+        if (!strstr(n, "ffn_") || !strstr(n, "_exps.")) {
+            continue;
+        }
+        int layer = -1;
+        if (sscanf(n, "blk.%d.", &layer) != 1) {
+            continue;
+        }
+        ranges.push_back(rng{ml.files.at(w.idx)->file_id(), w.offs, ggml_nbytes(w.tensor), layer});
+        total += ggml_nbytes(w.tensor);
+    }
+    if (ranges.empty()) {
+        return;
+    }
+    LLAMA_LOG_INFO("%s: qwen4exp expert prefetcher: %zu ranges, %.1f GiB, pace %d ms/layer\n",
+                   __func__, ranges.size(), total / 1073741824.0, pace_ms);
+    g_epf.stop.store(false);
+    g_epf.th = std::thread([ranges, pace_ms]() {
+        int last = -1;
+        for (const auto & r : ranges) {
+            if (g_epf.stop.load(std::memory_order_relaxed)) {
+                return;
+            }
+            if (pace_ms > 0 && r.layer != last) {
+                last = r.layer;
+                std::this_thread::sleep_for(std::chrono::milliseconds(pace_ms));
+                if (g_epf.stop.load(std::memory_order_relaxed)) {
+                    return;
+                }
+            }
+#ifndef _WIN32
+            posix_fadvise(r.fd, (off_t) r.off, (off_t) r.len, POSIX_FADV_WILLNEED);
+#endif
+        }
+    });
+}
+
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
 #endif
@@ -369,6 +451,8 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         if (!model->load_tensors(ml)) {
             return {-2, nullptr};
         }
+
+        llama_expert_prefetch_start(ml, ml.arch_name);
 
         return {0, model_ptr.release()};
     } catch (const std::exception & err) {
