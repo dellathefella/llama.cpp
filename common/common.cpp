@@ -1446,7 +1446,8 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
     }
 
     if (params.warmup) {
-        COM_TRC("%s", "warming up the model with an empty run - please wait ... (--no-warmup to disable)\n");
+        COM_INF("%s", "warming up the model with an empty run - please wait ... (--no-warmup to disable)\n");
+        COM_INF("%s", "note: first run on a host JIT-compiles every kernel (single-threaded per module); see ggml_sycl pre-JIT and progress heartbeats\n");
 
         std::vector<llama_token> tmp;
         llama_token bos = llama_vocab_bos(vocab);

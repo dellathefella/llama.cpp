@@ -24,6 +24,8 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <vector>
+#include <thread>
+#include <chrono>
 #include <cmath>
 #include <iostream>
 #include <fstream>
@@ -6113,8 +6115,21 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     ggml_sycl_set_main_device(sycl_ctx->device);
 
+    // base-level progress heartbeat: first-run JIT (and any multi-minute
+    // graph) would otherwise print nothing for minutes on slow hosts
+    const auto hb_t0 = std::chrono::steady_clock::now();
+    int hb_last = 0;
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
+        if (i - hb_last >= 512) {
+            hb_last = i;
+            const double hb_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - hb_t0).count();
+            if (hb_s > 10.0) {
+                GGML_LOG_INFO("ggml_sycl: graph compute progress %d/%d nodes (%.0f s elapsed, op=%s)\n",
+                              i, cgraph->n_nodes, hb_s, ggml_op_name(node->op));
+            }
+        }
         if (ggml_sycl_is_view_or_noop(node)) {
             continue;
         }
@@ -7354,7 +7369,112 @@ ggml_backend_reg_t ggml_backend_sycl_reg() {
     return &reg;
 }
 
+// Parallel first-touch JIT: each kernel module is compiled by the driver on
+// its first submit, single-threaded per module. Submitting dummy ops for
+// every quant x op family concurrently from N threads compiles N modules at
+// once, turning a minutes-long single-core JIT into a wall-clock fraction.
+// Disable with GGML_SYCL_PREJIT=0.
+static std::atomic<int> g_prejit_state[16];
+
+static void ggml_sycl_prejit_kernels(int device) {
+    const char * env = getenv("GGML_SYCL_PREJIT");
+    if (env && env[0] == '0') {
+        return;
+    }
+        const ggml_type types[] = {
+            GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
+            GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K,
+            GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS,
+            GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL,
+            GGML_TYPE_IQ4_XS, GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32,
+        };
+        const size_t n_types = sizeof(types) / sizeof(types[0]);
+        // work items: [type][0]=mul_mat, [type][1]=mul_mat_id, plus elemwise set
+        const size_t n_work = n_types * 2 + 8;
+        std::atomic<size_t> next{0};
+        const unsigned n_threads = std::min(16u, std::thread::hardware_concurrency());
+        const auto t0 = std::chrono::steady_clock::now();
+
+        auto worker = [&] {
+            ggml_backend_t be = ggml_backend_sycl_init(device);
+            if (!be) {
+                return;
+            }
+            while (true) {
+                const size_t w = next.fetch_add(1);
+                if (w >= n_work) {
+                    break;
+                }
+                struct ggml_context * ctx = ggml_init({ 16 * 1024 * 1024, nullptr, false });
+                if (!ctx) {
+                    continue;
+                }
+                ggml_tensor * out = nullptr;
+                if (w < n_types * 2) {
+                    const ggml_type t = types[w / 2];
+                    ggml_tensor * a = ggml_new_tensor_2d(ctx, t, 64, 16);
+                    ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 4);
+                    if (w % 2 == 0) {
+                        out = ggml_mul_mat(ctx, a, b);
+                    } else {
+                        ggml_tensor * as = ggml_new_tensor_3d(ctx, t, 64, 16, 2);
+                        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, 1);
+                        ggml_tensor * bb = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 4);
+                        (void) a; (void) b;
+                        out = ggml_mul_mat_id(ctx, as, bb, ids);
+                        ggml_backend_alloc_ctx_tensors(ctx, be);
+                        const int32_t zero[2] = { 0, 0 };
+                        ggml_backend_tensor_set(ids, zero, 0, sizeof(zero));
+                        ggml_cgraph * g = ggml_new_graph(ctx);
+                        ggml_build_forward_expand(g, out);
+                        ggml_backend_graph_compute(be, g);
+                        ggml_free(ctx);
+                        continue;
+                    }
+                } else {
+                    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 16);
+                    ggml_tensor * y = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 16);
+                    switch (w - n_types * 2) {
+                        case 0: out = ggml_add(ctx, x, y); break;
+                        case 1: out = ggml_mul(ctx, x, y); break;
+                        case 2: out = ggml_rms_norm(ctx, x, 1e-6f); break;
+                        case 3: out = ggml_soft_max(ctx, x); break;
+                        case 4: out = ggml_rope_ext(ctx, x, ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 8), ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1), 8, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f); break;
+                        case 5: out = ggml_cpy(ctx, x, ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 64, 16)); break;
+                        case 6: out = ggml_scale(ctx, x, 1.0f); break;
+                        default: out = ggml_sqr(ctx, x); break;
+                    }
+                }
+                ggml_backend_alloc_ctx_tensors(ctx, be);
+                ggml_cgraph * g = ggml_new_graph(ctx);
+                ggml_build_forward_expand(g, out);
+                ggml_backend_graph_compute(be, g);
+                ggml_free(ctx);
+            }
+            ggml_backend_free(be);
+        };
+
+        GGML_LOG_INFO("ggml_sycl: pre-JIT on %u threads (device %d): %zu kernel families\n",
+                      n_threads, device, n_work);
+        std::vector<std::thread> pool;
+        pool.reserve(n_threads);
+        for (unsigned i = 0; i < n_threads; i++) {
+            pool.emplace_back(worker);
+        }
+        for (auto & t : pool) {
+            t.join();
+        }
+        const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    GGML_LOG_INFO("ggml_sycl: pre-JIT done in %.1f s\n", s);
+}
+
 ggml_backend_t ggml_backend_sycl_init(int device) {
+    if (device >= 0 && device < 16) {
+        int expected = 0;
+        if (g_prejit_state[device].compare_exchange_strong(expected, 1)) {
+            ggml_sycl_prejit_kernels(device);
+        }
+    }
     GGML_SYCL_DEBUG("[SYCL] call ggml_backend_sycl_init\n");
     ggml_check_sycl();
 
