@@ -7405,7 +7405,7 @@ static void ggml_sycl_prejit_kernels(int device) {
                 if (w >= n_work) {
                     break;
                 }
-                struct ggml_context * ctx = ggml_init({ 16 * 1024 * 1024, nullptr, false });
+                struct ggml_context * ctx = ggml_init({ 16 * 1024 * 1024, nullptr, true });
                 if (!ctx) {
                     continue;
                 }
