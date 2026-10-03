@@ -7432,7 +7432,7 @@ static void ggml_sycl_prejit_kernels(int device) {
                         case 1: out = ggml_mul(ctx, x, y); break;
                         case 2: out = ggml_rms_norm(ctx, x, 1e-6f); break;
                         case 3: out = ggml_soft_max(ctx, x); break;
-                        case 4: out = ggml_rope_ext(ctx, x, ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 8), ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1), 8, 0, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f); break;
+                        case 4: out = ggml_rope_ext(ctx, x, ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1), ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4), 8, 0, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f); break;
                         case 5: out = ggml_cpy(ctx, x, ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 64, 16)); break;
                         case 6: out = ggml_scale(ctx, x, 1.0f); break;
                         default: out = ggml_sqr(ctx, x); break;
