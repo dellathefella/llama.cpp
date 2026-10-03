@@ -7410,6 +7410,7 @@ static void ggml_sycl_prejit_kernels(int device) {
                     continue;
                 }
                 ggml_tensor * out = nullptr;
+                ggml_tensor * ids = nullptr;
                 if (w < n_types * 2) {
                     const ggml_type t = types[w / 2];
                     ggml_tensor * a = ggml_new_tensor_2d(ctx, t, 64, 16);
@@ -7418,18 +7419,10 @@ static void ggml_sycl_prejit_kernels(int device) {
                         out = ggml_mul_mat(ctx, a, b);
                     } else {
                         ggml_tensor * as = ggml_new_tensor_3d(ctx, t, 64, 16, 2);
-                        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, 1);
-                        ggml_tensor * bb = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 4);
+                        ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, 1);
+                        ggml_tensor * bb = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 1);
                         (void) a; (void) b;
                         out = ggml_mul_mat_id(ctx, as, bb, ids);
-                        ggml_backend_alloc_ctx_tensors(ctx, be);
-                        const int32_t zero[2] = { 0, 0 };
-                        ggml_backend_tensor_set(ids, zero, 0, sizeof(zero));
-                        ggml_cgraph * g = ggml_new_graph(ctx);
-                        ggml_build_forward_expand(g, out);
-                        ggml_backend_graph_compute(be, g);
-                        ggml_free(ctx);
-                        continue;
                     }
                 } else {
                     ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 16);
@@ -7446,6 +7439,10 @@ static void ggml_sycl_prejit_kernels(int device) {
                     }
                 }
                 ggml_backend_alloc_ctx_tensors(ctx, be);
+                if (ids) {
+                    const int32_t zero[2] = { 0, 0 };
+                    ggml_backend_tensor_set(ids, zero, 0, sizeof(zero));
+                }
                 ggml_cgraph * g = ggml_new_graph(ctx);
                 ggml_build_forward_expand(g, out);
                 ggml_backend_graph_compute(be, g);
