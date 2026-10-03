@@ -7413,14 +7413,14 @@ static void ggml_sycl_prejit_kernels(int device) {
                 ggml_tensor * ids = nullptr;
                 if (w < n_types * 2) {
                     const ggml_type t = types[w / 2];
-                    ggml_tensor * a = ggml_new_tensor_2d(ctx, t, 64, 16);
-                    ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 4);
+                    ggml_tensor * a = ggml_new_tensor_2d(ctx, t, 256, 16);
+                    ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, 4);
                     if (w % 2 == 0) {
                         out = ggml_mul_mat(ctx, a, b);
                     } else {
-                        ggml_tensor * as = ggml_new_tensor_3d(ctx, t, 64, 16, 2);
+                        ggml_tensor * as = ggml_new_tensor_3d(ctx, t, 256, 16, 2);
                         ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, 1);
-                        ggml_tensor * bb = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 1);
+                        ggml_tensor * bb = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, 1);
                         (void) a; (void) b;
                         out = ggml_mul_mat_id(ctx, as, bb, ids);
                     }
