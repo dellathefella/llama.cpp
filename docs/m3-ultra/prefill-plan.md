@@ -20,14 +20,31 @@ activations -> worker computes. No overlap => 2nd GPU wasted.
 - ubatch 2048: ~+4% prefill over 1024.
 - Jumbo frames (MTU 9000) on the TB link: irrelevant now (cluster retired).
 
-## Known bugs blocking further gains (fork work)
-1. MTP speculative decoding (draft-mtp) kills the Metal backend in
-   23b0202a1: "ggml_metal_graph_compute: backend is in error state from a
-   previous command buffer failure" — reproduced solo AND over RPC. Decode
-   is stuck at ~27 tok/s without speculation; fixing the draft graph would
-   be the single biggest decode win. Suspect the MTP draft graph shape or
-   buffer sizing trips Metal on M3 Ultra.
-2. Pipeline micro-batching (Path B below) for 2-GPU prefill.
+## MTP speculative decoding — ROOT CAUSE FOUND (not a code bug)
+
+The draft-mtp crash ("backend is in error state from a previous command
+buffer failure", solo AND over RPC) is GPU memory exhaustion:
+kIOGPUCommandBufferCallbackErrorOutOfMemory. The MTP draft path's GPU
+memory scales with slots x n_ctx:
+
+| Config (GLM Q4_K, 512k ctx, M3 Ultra 256GB) | Result |
+|---|---|
+| 512k, 4 slots, f16 KV (even q8_0 KV both models) | GPU OOM at decode |
+| 512k, 1 slot, default ~75% wired limit | GPU OOM (marginal) |
+| 512k, 1 slot, wired limit 230GB (iogpu.wired_limit_mb=235520) | OK |
+| 262k, 4 slots, default limit | OK |
+
+Working config (now the default in the playbooks): -np 1 + f16 KV +
+iogpu.wired_limit_mb=235520 -> decode 27 -> 35-37 tok/s (acceptance
+~0.6-0.73, mean draft len ~3), prefill unaffected (295-307 tok/s).
+
+Upstream-worthy finding: the per-slot draft-path memory at large n_ctx is
+large enough that multi-slot serving OOMs a 256GB machine at 512k. A fix
+would cap or share draft-path buffers across slots.
+
+## Remaining fork work
+1. Pipeline micro-batching (Path B below) for 2-GPU prefill (deprioritized:
+   the RPC cluster is retired).
 
 ## Paths
 ### Path A - Data parallelism (no fork, true 2x throughput)
