@@ -42,8 +42,36 @@ Upstream-worthy finding: the per-slot draft-path memory at large n_ctx is
 large enough that multi-slot serving OOMs a 256GB machine at 512k. A fix
 would cap or share draft-path buffers across slots.
 
+## Serving config now (262k, 4 slots)
+Per user decision: context 262144 with FOUR slots (draft memory x 4 fits
+at 262k; 512k only supports 1 slot). Verified: MTP decode 35.15 tok/s
+(acceptance 0.61), prefill 312 tok/s.
+
+## M3-Ultra hardware tuning (llama-bench sweep, GLM Q4_K, Apple9)
+ubatch sweep at -fa 1, f16 KV:
+  ubatch  512 -> pp4096 260.07 | tg256 27.19 tok/s
+  ubatch 1024 -> pp4096 294.26 | tg256 27.24 tok/s
+  ubatch 2048 -> pp4096 311.91 | tg256 27.23 tok/s
+  ubatch 4096 -> pp4096 312.19 | tg256 27.26 tok/s
+Prefill saturates at ubatch 2048; 4096 adds nothing. recommendedMax-
+WorkingSetSize with iogpu.wired_limit_mb=235520: 246,960 MB.
+
+## fa-vec kernel tuning on M3 Ultra (in progress)
+ggml-metal now ships a kernel tuner (tools/tuning, PR #27824). The
+fa_vec_tuned_table keys rows by GPU FAMILY — Apple9 pools M3_ULTRA with
+A18_PRO/M3_MAX/M3_PRO/M4/M4_MAX/M4_PRO, so no M3-Ultra-specific rows
+exist. Sweep running on the M3 Ultra (f16 KV dtype, full head-size grid):
+  ggml-metal-tuning fa-vec --dtype f16 > fa_vec_rows.txt 2> fa_vec_sweep.log
+Next: retag the SKU column to family 9, replace the Apple9 f16 segment in
+ggml-metal-tuning.cpp with the M3-Ultra rows (this fork targets M3 Ultra
+only), validate numerics (test-backend-ops test -o FLASH_ATTN_EXT -b MTL0),
+rebuild, and A/B decode. Note: fa-vec tunes the DECODE attention path only;
+prefill matmul (mul_mm) has no tuner yet — a mul-mm tuner would be the
+upstream-worthy fork contribution.
+
 ## Remaining fork work
-1. Pipeline micro-batching (Path B below) for 2-GPU prefill (deprioritized:
+1. Apply M3-Ultra fa-vec rows (sweep above) and A/B decode.
+2. Pipeline micro-batching (Path B below) for 2-GPU prefill (deprioritized:
    the RPC cluster is retired).
 
 ## Paths
