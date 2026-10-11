@@ -56,7 +56,27 @@ ubatch sweep at -fa 1, f16 KV:
 Prefill saturates at ubatch 2048; 4096 adds nothing. recommendedMax-
 WorkingSetSize with iogpu.wired_limit_mb=235520: 246,960 MB.
 
-## fa-vec kernel tuning on M3 Ultra (in progress)
+## fa-vec kernel tuning on M3 Ultra (DONE — modest)
+Sweep completed 2026-10-10 (f16, full head-size grid). 19 rows kept by the
+no-harm compression; 15/19 IDENTICAL to the shipped pooled Apple9 rows —
+the M3 Ultra mostly agrees with the family tuning; 4 rows differ. Table
+patched on master (f70d3332e), numerics validated (240/240 on MTL0), and
+the serving build now carries it.
+
+Honest impact assessment for GLM (MLA dk=512 dv=512 f16): the one kept
+row covers the deep-KV (>=16k) ne01==4 bucket at +7% on the fa_vec kernel
+itself — attention is a slice of total decode cost, so end-to-end gain is
+small and engages only at deep context with 4-row MTP steps. Short-KV
+decode is baseline by design (bucket 0 always baseline). Measured runs:
+35.3 tok/s short-KV (unchanged, expected), 40.1 tok/s on a deeper-context
+run (partly acceptance variance 0.61 -> 0.74, not purely the tuning).
+
+Follow-ons worth doing:
+- q8_0 sweep: gpt-oss-20b on Studio0 serves q8_0 KV -> fa_vec_q8_0.
+- mul_mm tuner (prefill matmul has NO tuner upstream) — the real
+  prefill lever; GLM prefill is compute-bound at 312 tok/s.
+
+## fa-vec kernel tuning on M3 Ultra (archived notes)
 ggml-metal now ships a kernel tuner (tools/tuning, PR #27824). The
 fa_vec_tuned_table keys rows by GPU FAMILY — Apple9 pools M3_ULTRA with
 A18_PRO/M3_MAX/M3_PRO/M4/M4_MAX/M4_PRO, so no M3-Ultra-specific rows
