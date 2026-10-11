@@ -71,10 +71,27 @@ decode is baseline by design (bucket 0 always baseline). Measured runs:
 35.3 tok/s short-KV (unchanged, expected), 40.1 tok/s on a deeper-context
 run (partly acceptance variance 0.61 -> 0.74, not purely the tuning).
 
+## mul_mm tile sweep on M3 Ultra (DONE — negative result, do not re-run)
+Prefill is compute-bound at ~11 TFLOPS effective (~33% of the M3 Ultra's
+fp16 peak) with Q4_K in-kernel dequant. Swept the compile-time mul_mm tile
+constants (ggml-metal-impl.h N_MM_BLOCK_X/Y, N_MM_SIMD_GROUP_X/Y) on GLM:
+
+  tile (BX,BY,SX,SY)   NRA x NRB / threads   pp4096 tok/s
+  base 4,2,2,2 (ship)  128 x 256 / 128        312.19 +/- 0.18
+  small 2,2,2,2        64 x 128 / 128        312.39 +/- 0.18
+  wide 4,2,4,2        128 x 512 / 256        GPU fault (kIOGPUCommandBuffer-
+                                              CallbackErrorInnocentVictim)
+  tall 4,2,2,4        256 x 256 / 256        failed to run
+
+Throughput is tile-INVARIANT across the legal envelope; larger tiles fault
+the GPU (kernel geometry limits, not perf). The shipped (4,2,2,2) constants
+are already optimal for M3 Ultra. The 33%-of-peak ceiling is the Q4_K
+dequant ALU cost, not tiling — a mul_mm tuner would have nothing to win
+here. Remaining prefill levers: smaller quant (Q2_K exists but 2-bit
+quality cliff) or accept ~312 tok/s as practical for this model/quant.
+
 Follow-ons worth doing:
 - q8_0 sweep: gpt-oss-20b on Studio0 serves q8_0 KV -> fa_vec_q8_0.
-- mul_mm tuner (prefill matmul has NO tuner upstream) — the real
-  prefill lever; GLM prefill is compute-bound at 312 tok/s.
 
 ## fa-vec kernel tuning on M3 Ultra (archived notes)
 ggml-metal now ships a kernel tuner (tools/tuning, PR #27824). The
